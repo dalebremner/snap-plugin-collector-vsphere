@@ -78,6 +78,10 @@ func (a *govmomiAPI) Init(ctx context.Context, url, username, password, clusterN
 	return nil
 }
 
+func (a *govmomiAPI) GetCluster() (mo.ClusterComputeResource, error) {
+	return *a.cluster, nil
+}
+
 // Clear API retrieve cache
 func (a *govmomiAPI) ClearCache() {
 	a.datastores = nil

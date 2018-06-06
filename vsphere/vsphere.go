@@ -46,6 +46,11 @@ const (
 	nsVMInstance = 8
 	nsVMMetric   = 9
 
+	nsClusterGroup    = 3
+	nsCluster         = 4
+	nsClusterInstance = 5
+	nsClusterMetric   = 6
+
 	unitKilobyte = 1024
 	unitMegabyte = unitKilobyte * 1024
 )
@@ -97,6 +102,16 @@ var metricDepMap = map[string]map[string][]string{
 		"readLatency":     []string{"virtualDisk.totalReadLatency.average"},
 		"writeLatency":    []string{"virtualDisk.totalWriteLatency.average"},
 	},
+	"cluster": map[string][]string{
+		"cpuCapacity":    []string{"cpu.totalmhz.average"},
+		"cpuUsage":       []string{"clusterServices.effectivecpu.average"},
+		"memCapacity":    []string{"mem.totalmb.average"},
+		"memUsage":       []string{"clusterServices.effectivemem.average"},
+		"datastoreRead":  []string{"datastore.read.average"},
+		"datastoreWrite": []string{"datastore.write.average"},
+		"netPacketsTx":   []string{"net.throughput.pktsTx.average"},
+		"netPacketsRx":   []string{"net.throughput.pktsRx.average"},
+	},
 }
 
 // New returns instance of VsphereCollector
@@ -104,7 +119,7 @@ func New(isTest bool) *Collector {
 	collector := &Collector{}
 	collector.GovmomiResources = &govmomiClient{}
 	if isTest {
-		collector.GovmomiResources.api = &mockAPI{}
+		//collector.GovmomiResources.api = &mockAPI{}
 	} else {
 		collector.GovmomiResources.api = &govmomiAPI{}
 	}
@@ -169,6 +184,7 @@ func (c *Collector) updateQuerySpecMap(ctx context.Context, querySpecs perfQuery
 func (c *Collector) buildQuerySpecsForMetrics(ctx context.Context, mts []plugin.Metric) ([]types.PerfQuerySpec, error) {
 	hostQuerySpecs := make(perfQuerySpecMap)
 	vmQuerySpecs := make(perfQuerySpecMap)
+	clusterQuerySpecs := make(perfQuerySpecMap)
 	allQuerySpecs := []types.PerfQuerySpec{}
 
 	c.GovmomiResources.ClearCache()
@@ -202,6 +218,16 @@ func (c *Collector) buildQuerySpecsForMetrics(ctx context.Context, mts []plugin.
 					}
 				}
 			}
+		} else if m.Namespace[nsSource].Value == "cluster" { // Retrieve cluster metrics
+			cluster, err := c.GovmomiResources.GetCluster()
+			if err != nil {
+				return nil, err
+			}
+
+			err = c.updateQuerySpecMap(ctx, clusterQuerySpecs, 300, m.Namespace[nsClusterGroup].Value, m.Namespace[nsClusterMetric].Value, cluster.Name, cluster.Reference())
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -209,6 +235,9 @@ func (c *Collector) buildQuerySpecsForMetrics(ctx context.Context, mts []plugin.
 		allQuerySpecs = append(allQuerySpecs, qs)
 	}
 	for _, qs := range vmQuerySpecs {
+		allQuerySpecs = append(allQuerySpecs, qs)
+	}
+	for _, qs := range clusterQuerySpecs {
 		allQuerySpecs = append(allQuerySpecs, qs)
 	}
 
@@ -252,13 +281,15 @@ func (c *Collector) buildParsedQueryResponses(ctx context.Context, entity types.
 		counterGroup := counter.GroupInfo.GetElementDescription().Key
 		counterName := counter.NameInfo.GetElementDescription().Key + "." + fmt.Sprint(counter.RollupType)
 
-		if len(metric.Value) != 1 {
-			return nil, fmt.Errorf("incorrect number of values (%d) for counter %s.%s", len(metric.Value), counterGroup, counterName)
+		entityType := entity.GetPerfEntityMetricBase().Entity.Type
+		if entityType != "ClusterComputeResource" {
+			if len(metric.Value) != 1 {
+				return nil, fmt.Errorf("incorrect number of values (%d) for counter %s.%s", len(metric.Value), counterGroup, counterName)
+			}
 		}
 		metricData := metric.Value[0]
 
 		// Retrieve given entity info
-		entityType := entity.GetPerfEntityMetricBase().Entity.Type
 		entityRef := entity.GetPerfEntityMetricBase().Entity.Reference()
 		hostName := ""
 		vmName := ""
@@ -279,6 +310,13 @@ func (c *Collector) buildParsedQueryResponses(ctx context.Context, entity types.
 			}
 			hostName = vmHost.Name
 			vmName = vm.Name
+		} else if entityType == "ClusterComputeResource" {
+			cluster, err := c.GovmomiResources.GetCluster()
+			if err != nil {
+				return nil, err
+			}
+			hostName = cluster.Name
+			vmName = cluster.Name
 		}
 
 		// Append parsed response
@@ -443,6 +481,22 @@ func (c *Collector) CollectMetrics(mts []plugin.Metric) ([]plugin.Metric, error)
 					}
 				}
 			}
+		} else if m.Namespace[nsSource].Value == "cluster" {
+			clusterGroup := m.Namespace[nsClusterGroup].Value
+			clusterMetric := m.Namespace[nsClusterMetric].Value
+
+			clusterValues := c.filterQuery(results, "*", "*", metricDepMap[clusterGroup][clusterMetric], "*")
+			for _, v := range clusterValues {
+				metric := plugin.Metric{
+					Namespace: plugin.CopyNamespace(m.Namespace),
+					Data:      v.data,
+				}
+
+				metric.Namespace[nsCluster].Value = v.hostName
+				metric.Namespace[nsClusterInstance].Value = v.instance
+
+				metrics = append(metrics, metric)
+			}
 		}
 	}
 
@@ -470,6 +524,13 @@ func (c *Collector) createVMNs(group string, metric string) plugin.Namespace {
 		AddStaticElement("vm").
 		AddDynamicElement("vmname", "Name of virtual machine").
 		AddStaticElement(group).
+		AddDynamicElement("instance", "Metric instance ID").
+		AddStaticElement(metric)
+}
+
+func (c *Collector) createClusterNs(metric string) plugin.Namespace {
+	return plugin.NewNamespace(vendor, class, name, "cluster").
+		AddDynamicElement("clustername", "Name of cluster").
 		AddDynamicElement("instance", "Metric instance ID").
 		AddStaticElement(metric)
 }
@@ -553,6 +614,40 @@ func (c *Collector) GetMetricTypes(cfg plugin.Config) ([]plugin.Metric, error) {
 		Namespace:   c.createVMNs("virtualDisk", "writeLatency"),
 		Description: "Write latency",
 		Unit:        "millisecond"})
+
+	// CLUSTER
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("cpuCapacity"),
+		Description: "CPU capacity",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("cpuUsage"),
+		Description: "CPU usage",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("memCapacity"),
+		Description: "Memory capacity",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("memUsage"),
+		Description: "Memory usage",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("datastoreRead"),
+		Description: "Datastore read rate",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("datastoreWrite"),
+		Description: "Datastore write rate",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("netPacketsTx"),
+		Description: "Network transmit rate",
+		Unit:        "number"})
+	metrics = append(metrics, plugin.Metric{
+		Namespace:   c.createClusterNs("netPacketsRx"),
+		Description: "Network receive rate",
+		Unit:        "number"})
 
 	return metrics, nil
 }

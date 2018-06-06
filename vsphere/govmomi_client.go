@@ -60,6 +60,8 @@ type API interface {
 
 	// Clear API retrieve cache
 	ClearCache()
+
+	GetCluster() (mo.ClusterComputeResource, error)
 }
 
 // govmomiClient is proxy for API calls, providing more functionality and allowing to mock API calls separately for testing
@@ -236,4 +238,8 @@ func (c *govmomiClient) GetInstances(metric types.BasePerfEntityMetricBase) ([]t
 // types.PerfMetricIntSeries contains metric info (such as counter key) and slice of int64 values.
 func (c *govmomiClient) GetInstanceSeries(metric types.BasePerfMetricSeries) (*types.PerfMetricIntSeries, error) {
 	return metric.(*types.PerfMetricIntSeries), nil
+}
+
+func (c *govmomiClient) GetCluster() (mo.ClusterComputeResource, error) {
+	return c.api.GetCluster()
 }
